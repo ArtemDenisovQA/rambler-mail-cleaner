@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""
-rambler_cleanup.py
-
-ENVELOPE-based cleaner for Rambler.ru via IMAP.
-
-Rule matching (no extra flags):
-- If rule contains '@' -> treat as FULL EMAIL mask and match against "mailbox@host" via fnmatch
-  Example for Apple relay Reddit:
-    noreply_at_redditmail_com_*@privaterelay.appleid.com
-- Else if rule has wildcards (* ? [ ]) -> treat as HOST mask and match against sender domain (host)
-  Example:
-    *mvideo.ru
-- Else (plain domain like ozon.ru) -> match host == domain OR host endswith ".domain"
-  (so it matches sender.ozon.ru, news.ozon.ru automatically)
-"""
+# -*- coding: utf-8 -*-
 
 import os
 import time
@@ -22,21 +8,26 @@ import argparse
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, List, Set, Tuple
+from email.parser import BytesParser
+from email.policy import default as email_policy
+from email.utils import getaddresses
 
 from dotenv import load_dotenv
 from imapclient import IMAPClient
 
+# Всегда подхватываем .env рядом со скриптом
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
 
 IMAP_HOST = "imap.rambler.ru"
 IMAP_PORT = 993
 
+# Правила по умолчанию:
+# - обычный домен (ozon.ru) матчится как ozon.ru и *.ozon.ru (поддомены тоже)
+# - маска с '@' матчится по полному адресу отправителя (для Apple private relay)
 RULES_DEFAULT = [
     "ozon.ru",
-    "news@news.ozon.ru",
     "linkedin.com",
     "snob.ru",
-    "vk.com",
     "finam.ru",
     "mvideo.ru",
     "aliexpress.ru",
@@ -65,14 +56,9 @@ RULES_DEFAULT = [
     "smart-t.ru",
     "rusconcert.net",
     "vigoda.ru",
-    "idm.institute",
-    "intermeda.ru",
-    "strawberrynet.com",
-    "auto.ru",
-    "ticketland.ru",
-    "komus.ru",
-    "stockmann.ru",
+    "forumhouse.ru",
     "*reddit*@privaterelay.appleid.com",
+
 ]
 
 
@@ -101,13 +87,12 @@ def is_inuse_error(e: Exception) -> bool:
     return ("INUSE" in s) or ("INDEXING" in s) or ("TIMEOUT WHILE WAITING FOR INDEXING" in s)
 
 
-def fetch_with_retries(server: IMAPClient, uids: List[int], items: List[str],
-                       attempts: int = 4, base_delay: float = 2.0):
+def with_retries(fn, attempts: int = 4, base_delay: float = 2.0):
     delay = base_delay
     last = None
     for i in range(attempts):
         try:
-            return server.fetch(uids, items)
+            return fn()
         except Exception as e:
             last = e
             if is_inuse_error(e) and i < attempts - 1:
@@ -135,7 +120,7 @@ def list_selectable_mailboxes(server: IMAPClient) -> List[str]:
 def envelope_from_parts(envelope) -> Tuple[str, str, str]:
     """
     Returns (mailbox, host, full_email) from ENVELOPE.From[0]
-    full_email is lowercase "mailbox@host".
+    full_email is "mailbox@host" lowercased.
     """
     if not envelope or not getattr(envelope, "from_", None):
         return "", "", ""
@@ -146,8 +131,28 @@ def envelope_from_parts(envelope) -> Tuple[str, str, str]:
     return mailbox.lower(), host.lower(), full
 
 
+def parse_from_header(header_bytes: bytes) -> Tuple[str, str]:
+    """
+    Parse header block containing From: ...
+    Returns (host, full_email) lowercase, or ("","") if not found.
+    """
+    if not header_bytes:
+        return "", ""
+    msg = BytesParser(policy=email_policy).parsebytes(header_bytes)
+    from_value = msg.get("From", "")
+    if not from_value:
+        return "", ""
+    addrs = getaddresses([from_value])
+    if not addrs:
+        return "", ""
+    email_addr = (addrs[0][1] or "").strip().lower()
+    if "@" not in email_addr:
+        return "", ""
+    _local, host = email_addr.rsplit("@", 1)
+    return host.strip().lower(), email_addr
+
+
 def rule_kind(rule: str) -> str:
-    """Return 'email_mask', 'host_mask', or 'domain'."""
     r = rule.strip().lower()
     if "@" in r:
         return "email_mask"
@@ -161,15 +166,12 @@ def match_rule(rule: str, host: str, full_email: str) -> bool:
     kind = rule_kind(r)
 
     if kind == "email_mask":
-        # match against full sender email (needed for Apple relay)
         return bool(full_email) and fnmatch.fnmatch(full_email, r)
 
     if kind == "host_mask":
-        # match against host with wildcards
         return bool(host) and fnmatch.fnmatch(host.lower(), r)
 
-    # kind == "domain": match exact domain + subdomains safely
-    # host == ozon.ru OR host endswith .ozon.ru
+    # domain: host == dom OR host endswith ".dom"
     if not host:
         return False
     h = host.lower()
@@ -182,47 +184,28 @@ def delete_uids(server: IMAPClient, uids: List[int], batch: int, uidplus: bool) 
 
     deleted = 0
     for part in chunked(uids, max(1, batch)):
-        server.delete_messages(part)  # mark \Deleted
+        server.delete_messages(part)
         if uidplus and hasattr(server, "uid_expunge"):
-            server.uid_expunge(part)  # expunge only these if supported
+            server.uid_expunge(part)
         else:
-            server.expunge()          # expunge all \Deleted in folder
+            server.expunge()
         deleted += len(part)
     return deleted
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Rambler IMAP cleaner (ENVELOPE-based, mask/domain rules)")
+    ap = argparse.ArgumentParser(description="Rambler IMAP cleaner (scan all UIDs, match by rules)")
     ap.add_argument("--user", default=None, help="Login (or env RAMBLER_USER)")
     ap.add_argument("--password", default=None, help="Password/app-password (or env RAMBLER_PASS)")
-    ap.add_argument(
-        "--folders",
-        default="INBOX",
-        help='Folders: comma-separated ("INBOX,Spam") or "*" for all. Default: INBOX',
-    )
-    ap.add_argument(
-        "--skip-folders",
-        default="",
-        help='Folders to skip (comma-separated), e.g. "Sent Messages,Drafts,Trash"',
-    )
+    ap.add_argument("--folders", default="INBOX", help='Folders: "INBOX" or "*" or comma-separated')
+    ap.add_argument("--skip-folders", default="", help='Comma-separated folders to skip (e.g. "Sent Messages")')
     ap.add_argument("--list-folders", action="store_true", help="List IMAP folders and exit")
-
-    # оставил имя --domains, чтобы было совместимо с твоими командами
-    ap.add_argument(
-        "--domains",
-        default=",".join(RULES_DEFAULT),
-        help=(
-            "Comma-separated rules. Examples:\n"
-            "  ozon.ru                    -> matches ozon.ru and *.ozon.ru\n"
-            "  *mvideo.ru                 -> host glob-mask\n"
-            "  noreply_at_redditmail_com_*@privaterelay.appleid.com -> full sender email glob-mask"
-        ),
-    )
-
-    ap.add_argument("--delete", action="store_true", help="Actually delete messages (otherwise dry-run)")
-    ap.add_argument("--batch", type=int, default=500, help="Batch size for ENVELOPE fetch/delete (default 500)")
-    ap.add_argument("--retries", type=int, default=4, help="Retries on server [INUSE]/indexing (default 4)")
-    ap.add_argument("--retry-delay", type=float, default=2.0, help="Base delay seconds for retries (default 2.0)")
+    ap.add_argument("--rules", default=",".join(RULES_DEFAULT),
+                    help="Comma-separated rules (domains/masks). Example: ozon.ru,*.mvideo.ru,*reddit*@privaterelay.appleid.com")
+    ap.add_argument("--delete", action="store_true", help="Actually delete (otherwise dry-run)")
+    ap.add_argument("--batch", type=int, default=500, help="Batch size for fetch/delete (default 500)")
+    ap.add_argument("--retries", type=int, default=4, help="Retries on [INUSE]/indexing (default 4)")
+    ap.add_argument("--retry-delay", type=float, default=2.0, help="Base retry delay seconds (default 2.0)")
     return ap.parse_args()
 
 
@@ -234,7 +217,7 @@ def main() -> None:
     if not user or not password:
         raise SystemExit("Set credentials via --user/--password or env RAMBLER_USER / RAMBLER_PASS")
 
-    rules = [r.strip() for r in (args.domains or "").split(",") if r.strip()]
+    rules = [r.strip() for r in (args.rules or "").split(",") if r.strip()]
     if not rules:
         raise SystemExit("No rules provided")
 
@@ -258,12 +241,10 @@ def main() -> None:
 
         uidplus = supports_uidplus(server)
 
-        print(
-            f"Server: {IMAP_HOST}:{IMAP_PORT} SSL | Folders: {len(folders)} | Mode: {'DELETE' if args.delete else 'DRY-RUN'}"
-        )
+        print(f"Server: {IMAP_HOST}:{IMAP_PORT} SSL | Folders: {len(folders)} | Mode: {'DELETE' if args.delete else 'DRY-RUN'}")
         print("Rules:")
         for r in rules:
-            print(f"  {r}  ({rule_kind(r)})")
+            print(f"  {r} ({rule_kind(r)})")
         print()
 
         grand_per_rule = Counter()
@@ -278,33 +259,30 @@ def main() -> None:
                 continue
 
             try:
-                all_uids = server.search(["NOT", "DELETED"])
+                all_uids = with_retries(lambda: server.search(["NOT", "DELETED"]),
+                                        attempts=args.retries, base_delay=args.retry_delay)
             except Exception as e:
                 print(f"[WARN] UID listing failed in '{folder}': {e}")
                 continue
 
             per_rule = Counter()
             matched_uids: Set[int] = set()
-            missing_envelope = 0
 
             for part in chunked(all_uids, max(1, args.batch)):
-                fetched = fetch_with_retries(
-                    server,
-                    part,
-                    ["ENVELOPE"],
-                    attempts=args.retries,
-                    base_delay=args.retry_delay,
-                )
+                fetched = with_retries(lambda: server.fetch(part, ["ENVELOPE"]),
+                                      attempts=args.retries, base_delay=args.retry_delay)
+
+                need_header: List[int] = []
 
                 for uid, item in fetched.items():
-                    # FIX: ENVELOPE может отсутствовать в ответе на отдельные UID -> не падаем
                     env = item.get(b"ENVELOPE") or item.get("ENVELOPE")
                     if env is None:
-                        missing_envelope += 1
+                        need_header.append(uid)
                         continue
 
-                    _mailbox, host, full_email = envelope_from_parts(env)
+                    _mb, host, full_email = envelope_from_parts(env)
                     if not host and not full_email:
+                        need_header.append(uid)
                         continue
 
                     hit = False
@@ -312,9 +290,31 @@ def main() -> None:
                         if match_rule(r, host=host, full_email=full_email):
                             per_rule[r] += 1
                             hit = True
-
                     if hit:
                         matched_uids.add(uid)
+
+                if need_header:
+                    hdr = with_retries(
+                        lambda: server.fetch(need_header, ["BODY.PEEK[HEADER.FIELDS (FROM)]"]),
+                        attempts=args.retries, base_delay=args.retry_delay
+                    )
+                    for uid, item in hdr.items():
+                        raw = (
+                            item.get(b"BODY[HEADER.FIELDS (FROM)]")
+                            or item.get(b"BODY.PEEK[HEADER.FIELDS (FROM)]")
+                            or b""
+                        )
+                        host, full_email = parse_from_header(raw)
+                        if not host and not full_email:
+                            continue
+
+                        hit = False
+                        for r in rules:
+                            if match_rule(r, host=host, full_email=full_email):
+                                per_rule[r] += 1
+                                hit = True
+                        if hit:
+                            matched_uids.add(uid)
 
             folder_unique = len(matched_uids)
             if folder_unique == 0:
@@ -325,8 +325,6 @@ def main() -> None:
                 if per_rule[r]:
                     print(f"  {r:55s}: {per_rule[r]}")
             print(f"  -> Unique matched in folder: {folder_unique}")
-            if missing_envelope:
-                print(f"  (note: {missing_envelope} messages returned no ENVELOPE; skipped)")
 
             grand_per_rule.update(per_rule)
             grand_unique += folder_unique
